@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-class KafkaConfluentHelper():
+class KafkaConfluentHelper:
     def __init__(self, config):
     
         self.conf = {
