@@ -14,12 +14,55 @@ import json
 import time
 import os
 
+import sys
+
 import kafka_confluent as kc
 
 import logging
 logger = logging.getLogger(__name__)
 from dotenv import load_dotenv
 load_dotenv()
+
+
+# Helper function to wrap thread targets for fatal error handling
+def thread_wrapper(target_func, args=(), name=""):
+    def wrapped():
+        try:
+            target_func(*args)
+        except Exception:
+            logger.critical(f"Unhandled exception in thread '{name}', exiting entire process.")
+            traceback.print_exc(file=sys.stderr)
+            sys.exit(1)
+    return wrapped
+
+
+class Stop:
+    def __init__(self, stop_id, name, lat, lon):
+        self.stop_id = stop_id
+        self.name = name
+        self.lat = lat
+        self.lon = lon
+        self.routes = set()
+
+
+class Trip:
+    def __init__(self, trip_id, service_id, route_id, shape_id, stops):
+        self.trip_id = trip_id
+        self.service_id = service_id
+        self.route_id = route_id
+        self.shape_id = shape_id
+        self.stops = stops  # list of Stop in sequence
+
+
+class Route:
+    def __init__(self, route_id, short_name, long_name, color, trips, shape_geometry):
+        self.route_id = route_id
+        self.short_name = short_name
+        self.long_name = long_name
+        self.color = color
+        self.trips = trips  # list of Trip objects
+        self.shape_geometry = shape_geometry
+
 
 class GTFSStaticProducer:
     def __init__(self, receiver_config, kafka_config):
@@ -29,24 +72,158 @@ class GTFSStaticProducer:
         self.topic_name = "gtfs_static"
         self.partition_key = "0"
 
-        self.current_routes_trips = None
-        self.current_stops = None
-        
+        self.routes_dict = None
+        self.trips_dict = None
+        self.stops_dict = None
+
     def wait(self):
         time.sleep(self.config['GTFS_STATIC_UPDATE_MINS'] * 60)
 
     def pull_static_gtfs(self):
-        pass
+        def download_gtfs(url):
+            resp = requests.get(url)
+            resp.raise_for_status()
+            return zipfile.ZipFile(io.BytesIO(resp.content))
 
-    def produce_static_route_trips_to_kafka(self):
-        if self.current_routes_trips is not None:
-            # self.kc.send(topic=self.topic, key=self.partition_key, json_data=packet, headers=[('service',b'gtfs'), ('datatype',b'routes')])
-            pass
+        def load_gtfs_table(gtfs_zip, filename):
+            return pd.read_csv(gtfs_zip.open(filename))
+
+        gtfs_zip = download_gtfs(self.config['GTFS_STATIC_URL'])
+        routes = load_gtfs_table(gtfs_zip, 'routes.txt')
+        trips = load_gtfs_table(gtfs_zip, 'trips.txt')
+        shapes = load_gtfs_table(gtfs_zip, 'shapes.txt')
+        stop_times = load_gtfs_table(gtfs_zip, 'stop_times.txt')
+        stops = load_gtfs_table(gtfs_zip, 'stops.txt')
+
+        # join trips with routes
+        trips_with_routes = trips.merge(
+            routes[['route_id', 'route_short_name', 'route_long_name', 'route_color']],
+            on='route_id', how='left'
+        )
+
+        # Build geometry per shape_id
+        shape_lines = (
+            shapes
+            .sort_values(['shape_id', 'shape_pt_sequence'])
+            .groupby('shape_id')
+            .apply(lambda grp: LineString(zip(grp.shape_pt_lon, grp.shape_pt_lat)))
+            .rename('geometry')
+            .reset_index()
+        )
+        shapes_gdf = gpd.GeoDataFrame(shape_lines, geometry='geometry', crs='EPSG:4326')
+
+        stop_times_sorted = stop_times.sort_values(['trip_id', 'stop_sequence'])
+        stops_full = stop_times_sorted.merge(stops[['stop_id', 'stop_name', 'stop_lat', 'stop_lon']],
+                                             on='stop_id', how='left')
+        self.stops_dict = {row.stop_id: Stop(row.stop_id, row.stop_name, row.stop_lat, row.stop_lon)
+                           for _, row in stops.iterrows()}
+
+        # build a dictionary of shapes
+        shape_geom = dict(zip(shapes_gdf.shape_id, shapes_gdf.geometry))
+
+        # stops per trip
+        trip_to_stops = {
+            trip_id: [
+                Stop(row.stop_id, row.stop_name, row.stop_lat, row.stop_lon)
+                for idx, row in grp.iterrows()
+            ]
+            for trip_id, grp in stops_full.groupby('trip_id')
+        }
+
+        # build Trip objects
+        self.trips_dict = {}
+        for _, row in trips_with_routes.iterrows():
+            self.trips_dict[row.trip_id] = Trip(
+                trip_id=row.trip_id,
+                service_id=row.service_id,
+                route_id=row.route_id,
+                shape_id=row.shape_id,
+                stops=trip_to_stops.get(row.trip_id, [])
+            )
+
+        # Add route associations to each stop
+        for trip in self.trips_dict.values():
+            for stop in trip.stops:
+                if stop.stop_id in self.stops_dict:
+                    self.stops_dict[stop.stop_id].routes.add(trip.route_id)
+
+        # build Route objects
+        self.routes_dict = {}
+        for route_id, grp in trips_with_routes.groupby('route_id'):
+            any_trip = grp.iloc[0]
+            shape_id = any_trip.shape_id
+            self.routes_dict[route_id] = Route(
+                route_id=route_id,
+                short_name=any_trip.route_short_name,
+                long_name=any_trip.route_long_name,
+                color=any_trip.get('route_color', None),
+                trips=[self.trips_dict[t] for t in grp.trip_id],
+                shape_geometry=shape_geom.get(shape_id, None)
+            )
+
+    def produce_static_routes_to_kafka(self):
+        if self.routes_dict is not None:
+            for route in self.routes_dict.values():
+                payload = {
+                    "route_id": route.route_id,
+                    "short_name": route.short_name,
+                    "long_name": route.long_name,
+                    "color": route.color,
+                    "shape_wkt": route.shape_geometry.wkt if route.shape_geometry is not None else None,
+                    "shape_points": list(route.shape_geometry.coords) if route.shape_geometry is not None else [],
+                    "trips": [
+                        {
+                            "trip_id": t.trip_id,
+                            "service_id": t.service_id,
+                            "shape_id": t.shape_id,
+                            "stops": [
+                                {"stop_id": s.stop_id, "name": s.name, "lat": s.lat, "lon": s.lon}
+                                for s in t.stops
+                            ]
+                        } for t in route.trips
+                    ]
+                }
+                self.kc.send(topic=self.topic_name, key=self.partition_key,
+                             json_data=json.dumps(payload),
+                             headers=[('service', b'gtfs'), ('datatype', b'routes')])
+        else:
+            logger.error("Static routes not loaded yet!")
+
+    def produce_static_trips_to_kafka(self):
+        if self.trips_dict is not None:
+            for trip in self.trips_dict.values():
+                payload = {
+                    "trip_id": trip.trip_id,
+                    "service_id": trip.service_id,
+                    "route_id": trip.route_id,
+                    "shape_id": trip.shape_id,
+                    "stops": [
+                        {"stop_id": s.stop_id, "name": s.name, "lat": s.lat, "lon": s.lon}
+                        for s in trip.stops
+                    ]
+                }
+                self.kc.send(topic=self.topic_name, key=self.partition_key,
+                             json_data=json.dumps(payload),
+                             headers=[('service', b'gtfs'), ('datatype', b'trips')])
+        else:
+            logger.error("Static trips not loaded yet!")
 
     def produce_static_stops_to_kafka(self):
-        if self.current_stops is not None:
-            # self.kc.send(topic=self.topic, key=self.partition_key, json_data=packet, headers=[('service',b'gtfs'), ('datatype',b'stops')])
-            pass
+        if self.stops_dict is not None:
+            for stop in self.stops_dict.values():
+                payload = {
+                    "stop_id": stop.stop_id,
+                    "name": stop.name,
+                    "lat": stop.lat,
+                    "lon": stop.lon,
+                    "routes": list(stop.routes)
+                }
+                self.kc.send(topic=self.topic_name, key=self.partition_key,
+                             json_data=json.dumps(payload),
+                             headers=[('service', b'gtfs'), ('datatype', b'stops')])
+        else:
+            logger.error("Static stops not loaded yet!")
+
 
 
 class GTFSRTAlertsProducer:
@@ -93,7 +270,6 @@ class GTFSRTVehicleProducer:
         self.kc = kc.KafkaConfluentHelper(kafka_config)
 
         self.topic_name = "gtfs_vehicles"
-        self.partition_key = "0"
 
     def wait(self):
         time.sleep(self.config['GTFS_RT_VEHICLES_UPDATE_SECS'])
@@ -208,13 +384,13 @@ if __name__ == "__main__":
         'GTFS_RT_VEHICLES_URL': os.environ.get('GTFS_RT_VEHICLES_URL'),
         'GTFS_RT_VEHICLES_UPDATE_SECS': os.environ.get('GTFS_RT_VEHICLES_UPDATE_SECS'),
     }
-    
+
     common_kafka_config = {
         'KAFKA_BOOTSTRAP': os.environ.get('KAFKA_BOOTSTRAP'),
         'KAFKA_USER':  os.environ.get('KAFKA_USER'),
         'KAFKA_PASSWORD': os.environ.get('KAFKA_PASSWORD'),
     }
-    
+
     log_path = str(os.environ.get('LOG_PATH')) if os.environ.get('LOG_PATH') else "."
     loggerFile = log_path + '/gtfs2kafka.log'
     print('Saving logs to: ' + loggerFile)
@@ -222,8 +398,8 @@ if __name__ == "__main__":
     logging.basicConfig(filename=loggerFile, level=logging.INFO, format=FORMAT)
 
     logger.info("Starting 4x GTFS to Kafka producer threads.")
-    threading.Thread(target=update_gtfs_static, args=(static_config, common_kafka_config))
-    threading.Thread(target=update_gtfs_rt_alerts, args=(rt_config, common_kafka_config))
-    threading.Thread(target=update_gtfs_rt_vehicles, args=(rt_config, common_kafka_config))
-    threading.Thread(target=update_gtfs_rt_transit_updates, args=(rt_config, common_kafka_config))
+    threading.Thread(target=thread_wrapper(update_gtfs_static, args=(static_config, common_kafka_config), name="gtfs_static")).start()
+    threading.Thread(target=thread_wrapper(update_gtfs_rt_alerts, args=(rt_config, common_kafka_config), name="gtfs_alerts")).start()
+    threading.Thread(target=thread_wrapper(update_gtfs_rt_vehicles, args=(rt_config, common_kafka_config), name="gtfs_vehicles")).start()
+    threading.Thread(target=thread_wrapper(update_gtfs_rt_transit_updates, args=(rt_config, common_kafka_config), name="gtfs_transit_updates")).start()
         
