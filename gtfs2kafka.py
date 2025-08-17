@@ -2,8 +2,8 @@ import threading
 import traceback
 
 import requests
+import warnings, urllib3
 import argparse
-import time
 from google.transit import gtfs_realtime_pb2
 import geopandas as gpd
 import pandas as pd
@@ -46,27 +46,30 @@ class Stop:
 
 
 class Trip:
-    def __init__(self, trip_id, service_id, route_id, shape_id, stops):
+    def __init__(self, trip_id, service_id, route_id, shape_id, shape_geometry, stops):
         self.trip_id = trip_id
         self.service_id = service_id
         self.route_id = route_id
         self.shape_id = shape_id
+        self.shape_geometry = shape_geometry
         self.stops = stops  # list of Stop in sequence
 
 
 class Route:
-    def __init__(self, route_id, short_name, long_name, color, trips, shape_geometry):
+    def __init__(self, route_id, short_name, long_name, color, trips, shape_id, shape_geometry):
         self.route_id = route_id
         self.short_name = short_name
         self.long_name = long_name
         self.color = color
         self.trips = trips  # list of Trip objects
+        self.shape_id = shape_id
         self.shape_geometry = shape_geometry
 
 
 class GTFSStaticProducer:
-    def __init__(self, receiver_config, kafka_config):
-        self.config = receiver_config
+    def __init__(self, url, poll_interval_minutes, kafka_config):
+        self.url = url
+        self.poll_interval_seconds = poll_interval_minutes * 60
         self.kc = kc.KafkaConfluentHelper(kafka_config)
 
         self.topic_name = "gtfs_static"
@@ -77,23 +80,26 @@ class GTFSStaticProducer:
         self.stops_dict = None
 
     def wait(self):
-        time.sleep(self.config['GTFS_STATIC_UPDATE_MINS'] * 60)
+        time.sleep(self.poll_interval_seconds)
 
     def pull_static_gtfs(self):
         def download_gtfs(url):
-            resp = requests.get(url)
+            # Ignore SSL verification only for this specific download (certificate is currently invalid)
+            warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
+            logger.warning("Downloading GTFS static with SSL verification DISABLED for %s", url)
+            resp = requests.get(url, verify=False)
             resp.raise_for_status()
             return zipfile.ZipFile(io.BytesIO(resp.content))
 
         def load_gtfs_table(gtfs_zip, filename):
             return pd.read_csv(gtfs_zip.open(filename))
 
-        gtfs_zip = download_gtfs(self.config['GTFS_STATIC_URL'])
-        routes = load_gtfs_table(gtfs_zip, 'routes.txt')
-        trips = load_gtfs_table(gtfs_zip, 'trips.txt')
-        shapes = load_gtfs_table(gtfs_zip, 'shapes.txt')
-        stop_times = load_gtfs_table(gtfs_zip, 'stop_times.txt')
-        stops = load_gtfs_table(gtfs_zip, 'stops.txt')
+        rcv_zip = download_gtfs(self.url)
+        routes = load_gtfs_table(rcv_zip, 'routes.txt')
+        trips = load_gtfs_table(rcv_zip, 'trips.txt')
+        shapes = load_gtfs_table(rcv_zip, 'shapes.txt')
+        stop_times = load_gtfs_table(rcv_zip, 'stop_times.txt')
+        stops = load_gtfs_table(rcv_zip, 'stops.txt')
 
         # join trips with routes
         trips_with_routes = trips.merge(
@@ -105,8 +111,8 @@ class GTFSStaticProducer:
         shape_lines = (
             shapes
             .sort_values(['shape_id', 'shape_pt_sequence'])
-            .groupby('shape_id')
-            .apply(lambda grp: LineString(zip(grp.shape_pt_lon, grp.shape_pt_lat)))
+            .groupby('shape_id')[['shape_pt_lon', 'shape_pt_lat']]
+            .apply(lambda grp: LineString(zip(grp['shape_pt_lon'], grp['shape_pt_lat'])))
             .rename('geometry')
             .reset_index()
         )
@@ -138,6 +144,7 @@ class GTFSStaticProducer:
                 service_id=row.service_id,
                 route_id=row.route_id,
                 shape_id=row.shape_id,
+                shape_geometry=shape_geom.get(row.shape_id, None),
                 stops=trip_to_stops.get(row.trip_id, [])
             )
 
@@ -154,10 +161,11 @@ class GTFSStaticProducer:
             shape_id = any_trip.shape_id
             self.routes_dict[route_id] = Route(
                 route_id=route_id,
-                short_name=any_trip.route_short_name,
+                short_name=str(any_trip.route_short_name),
                 long_name=any_trip.route_long_name,
                 color=any_trip.get('route_color', None),
                 trips=[self.trips_dict[t] for t in grp.trip_id],
+                shape_id=shape_id,
                 shape_geometry=shape_geom.get(shape_id, None)
             )
 
@@ -176,16 +184,22 @@ class GTFSStaticProducer:
                             "trip_id": t.trip_id,
                             "service_id": t.service_id,
                             "shape_id": t.shape_id,
-                            "stops": [
-                                {"stop_id": s.stop_id, "name": s.name, "lat": s.lat, "lon": s.lon}
-                                for s in t.stops
-                            ]
+                            # "stops": [
+                            #     {"stop_id": s.stop_id, "name": s.name, "lat": s.lat, "lon": s.lon}
+                            #     for s in t.stops
+                            # ]
                         } for t in route.trips
                     ]
                 }
-                self.kc.send(topic=self.topic_name, key=self.partition_key,
-                             json_data=json.dumps(payload),
-                             headers=[('service', b'gtfs'), ('datatype', b'routes')])
+                try:
+                    self.kc.send(topic=self.topic_name, key=self.partition_key,
+                                 json_data=json.dumps(payload),
+                                 headers=[('service', b'gtfs'), ('datatype', b'routes')])
+                except:
+                    print(payload)
+                    traceback.print_exc()
+                    break
+            logger.info(f"Produced {len(self.routes_dict)} routes to Kafka from GTFS static.")
         else:
             logger.error("Static routes not loaded yet!")
 
@@ -205,6 +219,7 @@ class GTFSStaticProducer:
                 self.kc.send(topic=self.topic_name, key=self.partition_key,
                              json_data=json.dumps(payload),
                              headers=[('service', b'gtfs'), ('datatype', b'trips')])
+            logger.info(f"Produced {len(self.trips_dict)} trips to Kafka from GTFS static.")
         else:
             logger.error("Static trips not loaded yet!")
 
@@ -221,26 +236,28 @@ class GTFSStaticProducer:
                 self.kc.send(topic=self.topic_name, key=self.partition_key,
                              json_data=json.dumps(payload),
                              headers=[('service', b'gtfs'), ('datatype', b'stops')])
+            logger.info(f"Produced {len(self.stops_dict)} stops to kafka from GTFS static.")
         else:
             logger.error("Static stops not loaded yet!")
 
 
 
 class GTFSRTAlertsProducer:
-    def __init__(self, receiver_config, kafka_config):
-        self.config = receiver_config
+    def __init__(self, url, poll_interval, kafka_config):
+        self.url = url
+        self.poll_interval_seconds = poll_interval
         self.kc = kc.KafkaConfluentHelper(kafka_config)
 
         self.topic_name = "gtfs_alerts"
         self.partition_key = "0"
 
     def wait(self):
-        time.sleep(self.config['GTFS_RT_ALERTS_UPDATE_SECS'])
+        time.sleep(self.poll_interval_seconds)
 
     def receive_service_alerts(self):
-        response = requests.get(self.config['GTFS_RT_ALERTS_URL'])
+        response = requests.get(self.url)
         if response.status_code != 200:
-            raise ConnectionError(f"Failed to fetch data from {self.config['GTFS_RT_ALERTS_URL']}, "
+            raise ConnectionError(f"Failed to fetch data from {self.url}, "
                                   f"status code {response.status_code}")
         feed_data = response.content
         feed = gtfs_realtime_pb2.FeedMessage()
@@ -301,26 +318,30 @@ class GTFSRTAlertsProducer:
 
         return alerts_dict
 
-    def produce_service_alerts(self, packet):
-        # self.kc.send(topic=self.topic, key=self.partition_key, json_data=packet, headers=[('device',b'ouster'), ('detection',b'occupations')])
-        pass
+    def produce_service_alerts(self, dict_of_alerts):
+        for _, alert in dict_of_alerts.items():
+            self.kc.send(topic=self.topic_name, key=self.partition_key,
+                         json_data=json.dumps(alert),
+                         headers=[('service', b'gtfs'), ('datatype', b'alerts')])
+        logger.info(f"Produced {len(dict_of_alerts)} alerts to Kafka.")
 
 
 class GTFSRTTransitUpdatesProducer:
-    def __init__(self, receiver_config, kafka_config):
-        self.config = receiver_config
+    def __init__(self, url, poll_interval, kafka_config):
+        self.url = url
+        self.poll_interval_seconds = poll_interval
         self.kc = kc.KafkaConfluentHelper(kafka_config)
 
         self.topic_name = "gtfs_transit_updates"
         self.partition_key = "0"
 
     def wait(self):
-        time.sleep(self.config['GTFS_RT_TRIPS_UPDATE_SECS'])
+        time.sleep(self.poll_interval_seconds)
 
-    def receive_trip_updates(self, response_content):
-        response = requests.get(self.config['GTFS_RT_TRIPS_UPDATE_URL'])
+    def receive_trip_updates(self):
+        response = requests.get(self.url)
         if response.status_code != 200:
-            raise ConnectionError(f"Failed to fetch data from {self.config['GTFS_RT_TRIPS_UPDATE_URL']}, "
+            raise ConnectionError(f"Failed to fetch data from {self.url}, "
                                   f"status code {response.status_code}")
         feed_data = response.content
         feed = gtfs_realtime_pb2.FeedMessage()
@@ -380,14 +401,18 @@ class GTFSRTTransitUpdatesProducer:
 
         return updates_dict
 
-    def produce_transit_updates(self, packet):
-        # self.kc.send(topic=self.topic, key=self.partition_key, json_data=packet, headers=[('device',b'ouster'), ('detection',b'objects')])
-        pass
+    def produce_transit_updates(self, dict_of_updates):
+        for _, update in dict_of_updates.items():
+            self.kc.send(topic=self.topic_name, key=self.partition_key,
+                         json_data=json.dumps(update),
+                         headers=[('service', b'gtfs'), ('datatype', b'udpates')])
+        logger.info(f"Produced {len(dict_of_updates)} transit updates to Kafka.")
 
 
 class GTFSRTVehicleProducer:
-    def __init__(self, receiver_config, kafka_config):
-        self.config = receiver_config
+    def __init__(self, url, poll_interval, kafka_config):
+        self.url = url
+        self.poll_interval_seconds = poll_interval
         self.kc = kc.KafkaConfluentHelper(kafka_config)
 
         self.topic_name = "gtfs_vehicles"
@@ -400,20 +425,22 @@ class GTFSRTVehicleProducer:
         }
 
     def wait(self):
-        time.sleep(self.config['GTFS_RT_VEHICLES_UPDATE_SECS'])
+        time.sleep(self.poll_interval_seconds)
 
     def receive_vehicle_positions(self):
-        response = requests.get(self.config['GTFS_RT_VEHICLES_URL'])
+        response = requests.get(self.url)
         if response.status_code != 200:
-            raise ConnectionError(f"Failed to fetch data from {self.config['GTFS_RT_VEHICLES_URL']}, "
+            raise ConnectionError(f"Failed to fetch data from {self.url}, "
                                   f"status code {response.status_code}")
         feed_data = response.content
         feed = gtfs_realtime_pb2.FeedMessage()
         feed.ParseFromString(feed_data)
-        vehicle_positions = []
 
+        vehicle_positions = {}
+        num_skipped = 0
         for entity in feed.entity:
             if entity.HasField('vehicle'):
+                vehicle_id = entity.id
                 vehicle = entity.vehicle
                 position = vehicle.position
                 trip = vehicle.trip
@@ -426,10 +453,11 @@ class GTFSRTVehicleProducer:
                 if self.filter_bbox is not None and len(self.filter_bbox) > 0:
                     if not (self.filter_bbox['min_lat'] <= position.latitude <= self.filter_bbox['max_lat'] and
                             self.filter_bbox['min_lon'] <= position.longitude <= self.filter_bbox['max_lon']):
+                        num_skipped += 1
                         continue  # Skip vehicles outside the bounding box
 
-                vehicle_positions.append({
-                    'id': entity.id,
+                vehicle_positions[vehicle_id] = {
+                    'id': vehicle_id,
                     'latitude': position.latitude,
                     'longitude': position.longitude,
                     'bearing': position.bearing,
@@ -438,17 +466,21 @@ class GTFSRTVehicleProducer:
                     'trip_id': trip.trip_id,
                     'occupancy_pct': occupancy,
                     'timestamp': vehicle.timestamp
-                })
+                }
+        logger.info(f"Skipped {num_skipped} vehicles that were outside of bounding box.")
 
         return vehicle_positions
 
-    def produce_vehicle_positions(self, packet):
-        # self.kc.send(topic=self.topic, key=self.partition_key, json_data=packet, headers=[('device',b'ouster'), ('detection',b'zones')])
-        pass
+    def produce_vehicle_positions(self, dict_of_vehicle_positions):
+        for _, position in dict_of_vehicle_positions.items():
+            self.kc.send(topic=self.topic_name, key=position['id'],
+                         json_data=json.dumps(position),
+                         headers=[('service', b'gtfs'), ('datatype', b'vehicles')])
+        logger.info(f"Produced {len(dict_of_vehicle_positions)} vehicle positions to Kafka.")
 
 
-def update_gtfs_static(gtfs_static_config, receiver_kafka_config):
-    static_receiver = GTFSStaticProducer(gtfs_static_config, kafka_config=receiver_kafka_config)
+def update_gtfs_static(url, poll_interval_mins, receiver_kafka_config):
+    static_receiver = GTFSStaticProducer(url, poll_interval_mins, kafka_config=receiver_kafka_config)
     while True:
         # 1) update with new data from static GTFS
         try:
@@ -456,25 +488,32 @@ def update_gtfs_static(gtfs_static_config, receiver_kafka_config):
         except Exception as e:
             logger.error("Failed to update GTFS static data within producer.")
             logger.exception(e, exc_info=True)
+            static_receiver.wait()
             # Don't produce to Kafka if we couldn't receive correctly.
             continue
-        # 2) produce transit routes and trips to Kafka
+        # 2) produce transit routes to Kafka
         try:
-            static_receiver.produce_static_route_trips_to_kafka()
+            static_receiver.produce_static_routes_to_kafka()
         except Exception as e:
-            logger.error("Failed to assemble and send static transit routes and trips to Kafka.")
+            logger.error("Failed to assemble and send static transit routes to Kafka.")
             logger.exception(e, exc_info=True)
-        # 3) produce transit stops to Kafka
+        # 3) produce transit trips to Kafka
+        try:
+            static_receiver.produce_static_trips_to_kafka()
+        except Exception as e:
+            logger.error("Failed to assemble and send static transit trips to Kafka.")
+            logger.exception(e, exc_info=True)
+        # 4) produce transit stops to Kafka
         try:
             static_receiver.produce_static_stops_to_kafka()
         except Exception as e:
             logger.error("Failed to assemble and send static transit stops to Kafka.")
             logger.exception(e, exc_info=True)
-        # 4) invoke WAIT on the receiver object
+        # 5) invoke WAIT on the receiver object
         static_receiver.wait()
 
-def update_gtfs_rt_alerts(gtfs_receiver_config, receiver_kafka_config):
-    rt_alerts_receiver = GTFSRTAlertsProducer(gtfs_receiver_config, kafka_config=receiver_kafka_config)
+def update_gtfs_rt_alerts(url, poll_interval, receiver_kafka_config):
+    rt_alerts_receiver = GTFSRTAlertsProducer(url, poll_interval, kafka_config=receiver_kafka_config)
     logger.info("Created new instance of GTFS RT service alerts receiver.")
     while True:
         # 1) get the latest service alerts data
@@ -483,38 +522,40 @@ def update_gtfs_rt_alerts(gtfs_receiver_config, receiver_kafka_config):
         except Exception as e:
             logger.error("Failed to pull updated service alerts.")
             logger.exception(e, exc_info=True)
+            rt_alerts_receiver.wait()
             continue
         # 2) produce service alerts to Kafka
         try:
-            rt_alerts_receiver.produce_service_alerts(packet=rcv_data)
+            rt_alerts_receiver.produce_service_alerts(dict_of_alerts=rcv_data)
         except Exception as e:
             logger.error("Failed to assemble and send service alerts to Kafka.")
             logger.exception(e, exc_info=True)
         # 3) invoke WAIT on the receiver object
         rt_alerts_receiver.wait()
 
-def update_gtfs_rt_transit_updates(gtfs_receiver_config, receiver_kafka_config):
-    rt_transit_receiver = GTFSRTTransitUpdatesProducer(gtfs_receiver_config, kafka_config=receiver_kafka_config)
+def update_gtfs_rt_transit_updates(url, poll_interval, receiver_kafka_config):
+    rt_transit_receiver = GTFSRTTransitUpdatesProducer(url, poll_interval, kafka_config=receiver_kafka_config)
     logger.info("Created new instance of GTFS RT transit updates receiver.")
     while True:
         # 1) get the latest transit updates data
         try:
-            rcv_data = rt_transit_receiver.receive_transit_updates()
+            rcv_data = rt_transit_receiver.receive_trip_updates()
         except Exception as e:
             logger.error("Failed to pull new transit service updates.")
             logger.exception(e, exc_info=True)
+            rt_transit_receiver.wait()
             continue
         # 2) produce transit updates to Kafka
         try:
-            rt_transit_receiver.produce_transit_updates(packet=rcv_data)
+            rt_transit_receiver.produce_transit_updates(dict_of_updates=rcv_data)
         except Exception as e:
             logger.error("Failed to assemble and send new transit service updates to Kafka.")
             logger.exception(e, exc_info=True)
         # 3) invoke WAIT on the receiver object
         rt_transit_receiver.wait()
 
-def update_gtfs_rt_vehicles(gtfs_receiver_config, receiver_kafka_config):
-    rt_vehicles_receiver = GTFSRTVehicleProducer(gtfs_receiver_config, kafka_config=receiver_kafka_config)
+def update_gtfs_rt_vehicles(url, poll_interval, receiver_kafka_config):
+    rt_vehicles_receiver = GTFSRTVehicleProducer(url, poll_interval, kafka_config=receiver_kafka_config)
     logger.info("Created new instance of GTFS RT vehicles receiver.")
     while True:
         # 1) get the latest transit vehicles data
@@ -526,7 +567,7 @@ def update_gtfs_rt_vehicles(gtfs_receiver_config, receiver_kafka_config):
             continue
         # 2) produce vehicle positions to Kafka
         try:
-            rt_vehicles_receiver.produce_vehicle_positions(packet=rcv_data)
+            rt_vehicles_receiver.produce_vehicle_positions(dict_of_vehicle_positions=rcv_data)
         except Exception as e:
             logger.error("Failed to assemble and send new vehicle positions to Kafka.")
             logger.exception(e, exc_info=True)
@@ -534,22 +575,6 @@ def update_gtfs_rt_vehicles(gtfs_receiver_config, receiver_kafka_config):
         rt_vehicles_receiver.wait()
 
 if __name__ == "__main__":
-    static_config = {
-        'GTFS_STATIC_URL': os.environ.get('GTFS_STATIC_URL'),
-        'GTFS_STATIC_UPDATE_MINS': os.environ.get('GTFS_STATIC_UPDATE_MINS'),
-    }
-
-    rt_config = {
-        'GTFS_RT_ALERTS_URL': os.environ.get('GTFS_RT_ALERTS_URL'),
-        'GTFS_RT_ALERTS_UPDATE_SECS': os.environ.get('GTFS_RT_ALERTS_UPDATE_SECS'),
-
-        'GTFS_RT_TRIPS_URL': os.environ.get('GTFS_RT_TRIPS_URL'),
-        'GTFS_RT_TRIPS_UPDATE_SECS': os.environ.get('GTFS_RT_TRIPS_UPDATE_SECS'),
-
-        'GTFS_RT_VEHICLES_URL': os.environ.get('GTFS_RT_VEHICLES_URL'),
-        'GTFS_RT_VEHICLES_UPDATE_SECS': os.environ.get('GTFS_RT_VEHICLES_UPDATE_SECS'),
-    }
-
     common_kafka_config = {
         'KAFKA_BOOTSTRAP': os.environ.get('KAFKA_BOOTSTRAP'),
         'KAFKA_USER':  os.environ.get('KAFKA_USER'),
@@ -558,13 +583,45 @@ if __name__ == "__main__":
 
     log_path = str(os.environ.get('LOG_PATH')) if os.environ.get('LOG_PATH') else "."
     loggerFile = log_path + '/gtfs2kafka.log'
+    loggerFile = './gtfs2kafka.log'
     print('Saving logs to: ' + loggerFile)
     FORMAT = '%(asctime)s %(message)s'
-    logging.basicConfig(filename=loggerFile, level=logging.INFO, format=FORMAT)
+
+    debug = True  # set to False to disable console logging
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
+
+    file_handler = logging.FileHandler(loggerFile)
+    file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
+    file_handler.setFormatter(logging.Formatter(FORMAT))
+    root_logger.addHandler(file_handler)
+
+    if debug:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(logging.Formatter(FORMAT))
+        root_logger.addHandler(console_handler)
 
     logger.info("Starting 4x GTFS to Kafka producer threads.")
-    threading.Thread(target=thread_wrapper(update_gtfs_static, args=(static_config, common_kafka_config), name="gtfs_static")).start()
-    threading.Thread(target=thread_wrapper(update_gtfs_rt_alerts, args=(rt_config, common_kafka_config), name="gtfs_alerts")).start()
-    threading.Thread(target=thread_wrapper(update_gtfs_rt_vehicles, args=(rt_config, common_kafka_config), name="gtfs_vehicles")).start()
-    threading.Thread(target=thread_wrapper(update_gtfs_rt_transit_updates, args=(rt_config, common_kafka_config), name="gtfs_transit_updates")).start()
-        
+    if True:
+        threading.Thread(target=thread_wrapper(update_gtfs_static, args=(
+            os.environ.get('GTFS_STATIC_URL'),
+            int(os.environ.get('GTFS_STATIC_UPDATE_MINS')),
+            common_kafka_config), name="gtfs_static")).start()
+    if True:
+        threading.Thread(target=thread_wrapper(update_gtfs_rt_alerts, args=(
+            os.environ.get('GTFS_RT_ALERTS_URL'),
+            int(os.environ.get('GTFS_RT_ALERTS_UPDATE_SECS')),
+            common_kafka_config), name="gtfs_alerts")).start()
+    if True:
+        threading.Thread(target=thread_wrapper(update_gtfs_rt_vehicles, args=(
+            os.environ.get('GTFS_RT_VEHICLES_URL'),
+            int(os.environ.get('GTFS_RT_VEHICLES_UPDATE_SECS')),
+            common_kafka_config), name="gtfs_vehicles")).start()
+    if True:
+        threading.Thread(target=thread_wrapper(update_gtfs_rt_transit_updates, args=(
+            os.environ.get('GTFS_RT_TRIPS_URL'),
+            int(os.environ.get('GTFS_RT_TRIPS_UPDATE_SECS')),
+            common_kafka_config), name="gtfs_transit_updates")).start()
